@@ -1,13 +1,36 @@
+
+
 import numpy as np
 import cv2
 from sklearn.feature_extraction.image import extract_patches_2d as extract
 from sklearn.neighbors import NearestNeighbors
-# sklearn.neighbors.LSHForest gives deprecation warning, switch to pyflann
 import pyflann as pyflann
+
 """
 To get pyflann to work I had to copy the x64 directory from Lib>site-packages>pyflann>lib>win32 
-into envs>python>Lib>site-packages>pyflann>win32 
+into envs>python>Lib>site-packages>pyflann>win32. If you have difficulties just use sklearn, and remove references
+to pyflann.  
 """
+
+
+def read_images(apath, appath, bpath):
+    imgA = cv2.imread(apath, cv2.IMREAD_UNCHANGED)/255.0
+    imgAp = cv2.imread(appath, cv2.IMREAD_UNCHANGED)/255.0
+    imgB = cv2.imread(bpath, cv2.IMREAD_UNCHANGED)/255.0
+
+    return imgA, imgAp, imgB
+
+
+def add_pairs(imgA, imgAp, path1, path2):
+    imgA2 = cv2.imread(path1, cv2.IMREAD_UNCHANGED) / 255.0
+    imgAp2 = cv2.imread(path2, cv2.IMREAD_UNCHANGED) / 255.0
+    imgA2 = cv2.resize(imgA2,(imgA.shape[1],imgAp.shape[0]))
+    imgAp2 = cv2.resize(imgAp2, (imgAp.shape[1],imgAp.shape[0]))
+    matA = cv2.hconcat([imgA,imgA2])
+    matAp = cv2.hconcat([imgAp,imgAp2])
+
+    return matA, matAp
+
 
 def remap_y(imgA,imgB):
     meanA = np.mean(imgA)
@@ -19,13 +42,19 @@ def remap_y(imgA,imgB):
 
     return imgA_remapped
 
-def rgb2yiq(image):
+
+def rgb2yiq(image, remap=False, remap_target=None, feature='y'):
     yiq_xform = np.array([[0.299, 0.587, 0.114],
                           [0.596, -0.275, -0.321],
                          [0.212, -0.523, 0.311]])
     yiq = np.dot(image, yiq_xform.T.copy())
 
-    return yiq
+    if remap:
+        remap_y(image, remap_target)
+    if feature == 'y':
+        return yiq[:,:,0]
+    elif feature == 'yiq':
+        return yiq
 
 
 def yiq2rgb(image):
@@ -49,113 +78,241 @@ def get_pyramid(image, levels):
 
 def get_features(img, causal=False):
 
-    image_features = []
-
-    # for each level, also get level - 1
-    current_level_features = []
     #create 5x5 neighborhood for L, pad so that feature list is correct dimensions
     patches = cv2.copyMakeBorder(img,2,2,2,2,cv2.BORDER_DEFAULT)
     patches = extract(patches, (5, 5))
+    if causal:
+        features = np.zeros((img.shape[0],img.shape[1],12))
+    else:
+        features = np.zeros((img.shape[0],img.shape[1],25))
 
-    # for each pixel in pyramid current level create feature vector and concatenate level and level-1
     height, width = img.shape  # dimensions of the current level of the gaussian pyramid
     for i in range(height):
         for j in range(width):
-            if causal:
-                current_level_vector = patches[i * width + j].flatten()[0:12]
-            else:
-                current_level_vector = patches[i*width+j].flatten()
-            current_level_features.append(current_level_vector)
+                features[i, j, :] = patches[i * width + j].flatten()[0:features.shape[2]]
 
-    image_features = np.vstack(current_level_features)  # put vector in format for Flann
-    #image_features.append(image_vector)  # append it to total feature list, create list for each level of pyr
-
-    return image_features
+    return features
 
 
-def make_analogy(A_f, Ap, B, Bp, s, coh_fact, method='pyflann'):
+def make_analogy(lvl, Nlvl, A_L, Ap_L, B_L, Bp_L, s_L, kappa=0, method='pyflann'):
+    A_f = get_features(A_L[lvl])
+    Ap_f = get_features(Ap_L[lvl][:,:,0], causal=True)
+    A_f = np.concatenate((A_f, Ap_f), 2)
+
+    # initialize additional feature sets and B mats
+    if lvl < Nlvl:
+        Ad_f = cv2.resize(A_L[lvl+1], (A_L[lvl].shape[1],A_L[lvl].shape[0]), interpolation=cv2.INTER_CUBIC)
+        Ad_f = get_features(Ad_f)
+        Apd_f = cv2.resize(Ap_L[lvl + 1][:,:,0], (Ap_L[lvl].shape[1], Ap_L[lvl].shape[0]), interpolation=cv2.INTER_CUBIC)
+        Apd_f = get_features(Apd_f)
+        A_f = np.concatenate((A_f, Ad_f, Apd_f), 2)
+        B1 = cv2.resize(B_L[lvl + 1], dsize=(B_L[lvl].shape[1], B_L[lvl].shape[0]), interpolation=cv2.INTER_CUBIC)
+        Bp1 = cv2.resize(Bp_L[lvl + 1], dsize=(Bp_L[lvl].shape[1], Bp_L[lvl].shape[0]), interpolation=cv2.INTER_CUBIC)
+        B1_border = cv2.copyMakeBorder(B1, 2, 2, 2, 2, cv2.BORDER_DEFAULT)
+        Bp1_border = cv2.copyMakeBorder(Bp1, 2, 2, 2, 2, cv2.BORDER_DEFAULT)
+
+    # initialize mat by taking previous pyramid level and resize it to the same shape as the current level
+    # for lvl=Nlvl you can initialize it with current Ap, B or with some randomization function. You can
+    # get some really interesting results from changing the source for the first B'
+    if lvl < Nlvl:
+        Bp_L[lvl] = cv2.resize(Bp_L[lvl+1], dsize=(Bp_L[lvl].shape[1], Bp_L[lvl].shape[0]), interpolation=cv2.INTER_CUBIC)
+    else:
+        Bp_L[lvl] = cv2.resize(B_L[lvl], dsize=(Bp_L[lvl].shape[1], Bp_L[lvl].shape[0]), interpolation=cv2.INTER_CUBIC)
+
+    # resolve border issue by padding 2 pixels for 5x5 neighborhood
+    B_border = cv2.copyMakeBorder(B_L[lvl],2,2,2,2,cv2.BORDER_DEFAULT)
+    Bp_border = cv2.copyMakeBorder(Bp_L[lvl],2,2,2,2, cv2.BORDER_DEFAULT)
+
+    # put feature list into index format M*N,numFeatures (25+12)
+    A_f_2d = np.reshape(A_f, (A_f.shape[0]*A_f.shape[1], A_f.shape[2]))
+
+    """  Begin Neighbor Search Methods  """
     if method == 'pyflann_kmeans':
         flann = pyflann.FLANN()
 
-        print("Building FLANN kmeans index for size:", A_f.size, "for A size", Ap.size)
-        flann_p = flann.build_index(A_f, algorithm="kmeans", branching=32, iterations=-1, checks=16)
+        print("Building FLANN kmeans index for size:", A_f.size, "for A size", Ap_L[lvl].size)
+        flann_p = flann.build_index(A_f_2d, algorithm="kmeans", branching=32, iterations=-1, checks=16)
         print("FLANN kmeans index done...")
 
     elif method == 'pyflann_kdtree':
         flann = pyflann.FLANN()
 
-        print("Building FLANN kdtree index for size:", A_f.size, "for A size", Ap.size)
-        flann_p = flann.build_index(A_f, algorithm="kdtree")
+        print("Building FLANN kdtree index for size:", A_f.size, "for A size", Ap_L[lvl].size)
+        flann_p = flann.build_index(A_f_2d, algorithm="kdtree")
         print("FLANN kdtree index done...")
 
-    elif method == 'nn':
-        print("Building Scikit Nearest Neighbors index for size:", A_f.size, "for A size", Ap.size)
-        sknn = NearestNeighbors(n_neighbors=1, algorithm='auto').fit(A_f)
+    elif method == 'sk_nn':
+        print("Building Scikit Nearest Neighbors index for size:", A_f.size, "for A size", Ap_L[lvl].size)
+        sknn = NearestNeighbors(n_neighbors=1, algorithm='auto').fit(A_f_2d)
         print("NN index done...")
+    """  End Neighbor Search Methods  """
 
-    B_border = cv2.copyMakeBorder(B,2,2,2,2,cv2.BORDER_DEFAULT)
-    Bp_border = cv2.copyMakeBorder(Bp, 2, 2, 2, 2, cv2.BORDER_DEFAULT)
-
-    Ap_int = np.uint8(Ap.copy()*255)
-    cv2.imshow("ap", Ap_int)
-    cv2.waitKey(1)
     coh_chosen = 0
 
-    #for x in range(2, B.shape[0]-2):\
     for x in range(2, B_border.shape[0]-2):
-        Bp_int = np.uint8(Bp.copy()*255)
-        cv2.imshow("bp", Bp_int)
-        cv2.waitKey(1)
-        #for y in range(2, B.shape[1]-2):
+        if x%25 == 0:
+            print("Rastering row", x, "of", B_border.shape[0]-4)
+
         for y in range(2, B_border.shape[1]-2):
+            # this is where you really are in B
+            bx, by = x-2, y-2
+
+            B_patch = B_border[x-2:x+3,y-2:y+3,0].flatten()
+            Bp_causal = Bp_border[x-2:x+1,y-2:y+3,0].flatten()[0:12]
+            B_f = np.concatenate((B_patch, Bp_causal))
+
+            if lvl < Nlvl:  # get same set features as A_F
+                B1_patch = B1_border[x-2:x+3,y-2:y+3,0].flatten()
+                Bp1_patch = Bp1_border[x-2:x+3,y-2:y+3,0].flatten()
+                B_f = np.concatenate((B_f, B1_patch, Bp1_patch),0)
+
+            if method == 'sk_nn':
+                distance, neighbor = sknn.kneighbors(B_f[None, :])
+                neighbor = int(neighbor[0])
+            else:
+                neighbor, distance = flann.nn_index(B_f, 1, checks=flann_p['checks'])
+            distance = distance**2
+            # get p. turn number in neighbor to coordinate in A_f
+            m,n = np.unravel_index(neighbor, (A_f.shape[0], A_f.shape[1]))
+            if kappa > 0:
+                coh_neighbor, coh_distance = get_coherent(A_f, B_f, bx, by, s_L[lvl])
+                # coh_fact is squared to get it closer to the performance as described in Hertzmann paper
+                coh_fact = (1.0 + 2.0 ** (lvl - Nlvl) * kappa)**2
+                if coh_distance <= distance*coh_fact:
+                    m,n = coh_neighbor
+                    coh_chosen += 1
+
+            Bp_L[lvl][bx,by,0] = Ap_L[lvl][m,n,0]
+            # save s
+            s_L[lvl][bx, by, :] = [m,n]
+
+    print("coherent pixel chosen", coh_chosen, "times.")
+
+    return Bp_L[lvl]
+
+
+def make_analogy_color(lvl, Nlvl, A_L, Ap_L, B_L, Bp_L, s_L, kappa=0, method='pyflann'):
+    A_f = get_features(rgb2yiq(A_L[lvl], remap=True, remap_target=B_L[lvl]))
+    Ap_f = get_features(rgb2yiq(Ap_L[lvl], remap=True, remap_target=B_L[lvl]), causal=True)
+    A_f = np.concatenate((A_f, Ap_f), 2)
+
+    # initialize additional feature sets and B mats
+    if lvl < Nlvl:
+        Ad_f = cv2.resize(A_L[lvl+1], (A_L[lvl].shape[1],A_L[lvl].shape[0]), interpolation=cv2.INTER_CUBIC)
+        Ad_f = get_features(rgb2yiq(Ad_f, remap=True, remap_target=B_L[lvl+1]))
+        Apd_f = cv2.resize(Ap_L[lvl + 1], (Ap_L[lvl].shape[1], Ap_L[lvl].shape[0]), interpolation=cv2.INTER_CUBIC)
+        Apd_f = get_features(rgb2yiq(Apd_f, remap=True, remap_target=B_L[lvl+1]))
+        A_f = np.concatenate((A_f, Ad_f, Apd_f), 2)
+        B1 = cv2.resize(B_L[lvl + 1], dsize=(B_L[lvl].shape[1], B_L[lvl].shape[0]), interpolation=cv2.INTER_CUBIC)
+        Bp1 = cv2.resize(Bp_L[lvl + 1], dsize=(Bp_L[lvl].shape[1], Bp_L[lvl].shape[0]), interpolation=cv2.INTER_CUBIC)
+        B1_border = cv2.copyMakeBorder(B1, 2, 2, 2, 2, cv2.BORDER_DEFAULT)
+        Bp1_border = cv2.copyMakeBorder(Bp1, 2, 2, 2, 2, cv2.BORDER_DEFAULT)
+
+    # initialize mat by taking previous pyramid level and resize it to the same shape as the current level
+    # for lvl=Nlvl you can initialize it with current Ap or with some randomization function
+    if lvl < Nlvl:
+        Bp_L[lvl] = cv2.resize(Bp_L[lvl+1], dsize=(Bp_L[lvl].shape[1], Bp_L[lvl].shape[0]), interpolation=cv2.INTER_CUBIC)
+    else:
+        Bp_L[lvl] = cv2.resize(B_L[lvl], dsize=(Bp_L[lvl].shape[1], Bp_L[lvl].shape[0]), interpolation=cv2.INTER_CUBIC)
+
+    # resolve border issue by padding 2 pixels for 5x5 neighborhood
+    B_border = cv2.copyMakeBorder(B_L[lvl],2,2,2,2,cv2.BORDER_DEFAULT)
+    Bp_border = cv2.copyMakeBorder(Bp_L[lvl],2,2,2,2, cv2.BORDER_DEFAULT)
+
+    # put feature list into index format M*N,numFeatures (25+12)
+    A_f_2d = np.reshape(A_f, (A_f.shape[0]*A_f.shape[1], A_f.shape[2]))
+
+    """  Begin Neighbor Search Methods  """
+    if method == 'pyflann_kmeans':
+        flann = pyflann.FLANN()
+
+        print("Building FLANN kmeans index for size:", A_f.size, "for A size", Ap_L[lvl].size)
+        flann_p = flann.build_index(A_f_2d, algorithm="kmeans", branching=32, iterations=-1, checks=16)
+        print("FLANN kmeans index done...")
+
+    elif method == 'pyflann_kdtree':
+        flann = pyflann.FLANN()
+
+        print("Building FLANN kdtree index for size:", A_f.size, "for A size", Ap_L[lvl].size)
+        flann_p = flann.build_index(A_f_2d, algorithm="kdtree")
+        print("FLANN kdtree index done...")
+
+    elif method == 'sk_nn':
+        print("Building Scikit Nearest Neighbors index for size:", A_f.size, "for A size", Ap_L[lvl].size)
+        sknn = NearestNeighbors(n_neighbors=1, algorithm='auto').fit(A_f_2d)
+        print("NN index done...")
+    """  End Neighbor Search Methods  """
+
+    coh_chosen = 0
+
+    for x in range(2, B_border.shape[0]-2):
+        #Bp_int = np.uint8(Bp_L[lvl][:,:,0].copy()*255)
+        #cv2.imshow("bp", Bp_int)
+        #cv2.waitKey(1)
+        if x%25 == 0:
+            print("Rastering row", x, "of", B_border.shape[0]-4)
+
+        for y in range(2, B_border.shape[1]-2):
+            # this is where you really are in B
             bx = x-2
             by = y-2
 
-            B_patch = B_border[x-2:x+3,y-2:y+3].flatten()
-            Bp_causal = Bp_border[x-2:x+1,y-2:y+3].flatten()[0:12]
-            B_ff = np.concatenate((B_patch, Bp_causal))
+            B_patch = rgb2yiq(B_border[x-2:x+3,y-2:y+3]).flatten()
+            Bp_causal = rgb2yiq(Bp_border[x-2:x+1,y-2:y+3]).flatten()[0:12]
+            B_f = np.concatenate((B_patch, Bp_causal))
 
+            if lvl < Nlvl:  # get same set features as A_F
+                B1_patch = rgb2yiq(B1_border[x-2:x+3,y-2:y+3]).flatten()
+                Bp1_patch = rgb2yiq(Bp1_border[x-2:x+3,y-2:y+3]).flatten()
+                B_f = np.concatenate((B_f, B1_patch, Bp1_patch),0)
 
-            if method == 'nn':
-                distance, neighbor = sknn.kneighbors(B_ff[None, :])
+            if method == 'sk_nn':
+                distance, neighbor = sknn.kneighbors(B_f[None, :])
                 neighbor = int(neighbor[0])
             else:
-                neighbor, distance = flann.nn_index(B_ff, 1, checks=flann_p['checks'])
+                neighbor, distance = flann.nn_index(B_f, 1, checks=flann_p['checks'])
             distance = distance**2
             # get p
-            neighbor_ = np.unravel_index(neighbor%Ap.size, (Ap.shape[0],Ap.shape[1]))  # turn number in neighbor to coordinate in Ap
-
-            if coh_fact > 2:  # kappa > 0
-                coh_neighbor, coh_distance = get_coherent(A_f, B_ff, x, y, Ap.shape[0], Ap.shape[1],s)
+            # turn number in neighbor to coordinate in A_f
+            m,n = np.unravel_index(neighbor, (A_f.shape[0], A_f.shape[1]))
+            if kappa > 0:  # kappa > 0
+                coh_neighbor, coh_distance = get_coherent(A_f, B_f, bx, by, s_L[lvl])
+                # coh_fact is squared to get it closer to the performance as described in Hertzmann paper
+                coh_fact = (1.0 + 2.0 ** (lvl - Nlvl) * kappa)**2
                 if coh_distance <= distance*coh_fact:
-                    neighbor_ = coh_neighbor
+                    m,n = coh_neighbor
                     coh_chosen += 1
-            #print("Value:", Ap[m,n],"written to", x, ",", y)
-            Bp[bx, by] = Ap[neighbor_]  # move luminance value (Y of YIQ) into Bprime
-            # save s
-            s[bx, by, :] = neighbor_
-    print("coherent pixel chosen", coh_chosen, "times.")
-    return Bp
 
-def get_coherent(A_f,B_ff,x,y,M,N,s):  # tuned for 5x5 patches only
+
+            Bp_L[lvl][bx,by,:] = Ap_L[lvl][m,n,:]  # move value into Bprime
+
+            # save s
+            s_L[lvl][bx, by, :] = [m,n]
+
+    print("Coherent pixel chosen", coh_chosen, "/", Bp_L[lvl].size, "times.")
+
+    return Bp_L[lvl]
+
+
+def get_coherent(A_f,B_f,x,y,s):  # tuned for 5x5 patches only
     min_distance = np.inf
     cohxy = [-1, -1]
-    for i in range(5):
-        for j in range(5):
-            if i == 3 and j == 3:  # only do causal portion
+    for i in range(-2, 3, 1):
+        for j in range(-2, 3, 1):
+            if i == 0 and j == 0:  # only do causal portion
                 break
-            qx,qy = int(x+i-2), int(y+j-2)
-            if qx < 0 or qx >= s.shape[0] or qy < 0 or qy >= s.shape[1]:
+            if x+i >= s.shape[0] or y+j >= s.shape[1]:
                 continue
-            sx,sy = s[qx,qy]
-            sx,sy = int(sx),int(sy)
-            if sx < 0 or sy < 0:
+            sx,sy = int(s[x+i,y+j,0]),int(s[x+i,y+j,1])
+            if sx == -1 or sy == -1:
                 continue
-            index = sx + sy*N
-            rstar = np.sum((A_f[index]-B_ff)**2)
+            rx, ry = sx-i, sy-j
+            if rx < 0 or rx >= A_f.shape[0] or ry < 0 or ry >= A_f.shape[1]:
+                continue
+            rstar = np.sum((A_f[rx,ry,:]-B_f)**2)
             if rstar < min_distance:
                 min_distance = rstar
-                cohxy = sx,sy
+                cohxy = rx, ry
 
     return cohxy, min_distance
 
